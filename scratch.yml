@@ -1,23 +1,45 @@
-- name: Reboot now (inline)
-  when:
-    - sccm_allow_reboot | bool
-    - sccm_pending_reboot | bool
-  ansible.windows.win_reboot:
-    msg: "Rebooting to complete SCCM updates (Autopilot)."
-    pre_reboot_delay: 15
-    reboot_timeout: 3600
+# 1) Trigger fresh scan + deployment evaluation (post-reboot safe with retries)
+- name: Trigger SU Scan + Deployment Eval (resilient)
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
 
-# NEW: ensure the outer loop runs at least one more pass after a reboot
-- name: Mark another pass required after reboot
-  when:
-    - sccm_allow_reboot | bool
-    - sccm_pending_reboot | bool
-  ansible.builtin.set_fact:
-    sccm_remaining: 9999
+      # 0) Make sure the SCCM client service is up
+      try { Start-Service -Name CcmExec -ErrorAction SilentlyContinue } catch {}
+      try { (Get-Service -Name CcmExec).WaitForStatus('Running','00:02:00') } catch {}
 
-- name: Wait after reboot (settle)
-  ansible.builtin.pause:
-    seconds: "{{ sccm_wait_after_reboot }}"
-  when:
-    - sccm_allow_reboot | bool
-    - sccm_pending_reboot | bool
+      # 1) Wait for the root\ccm namespace/SMS_Client class to be accessible
+      $maxTries = 20   # ~3 minutes max below
+      $delaySec = 10
+      for($i=1; $i -le $maxTries; $i++){
+        try {
+          $null = Get-CimInstance -Namespace 'root\ccm' -ClassName 'SMS_Client' -ErrorAction Stop
+          break
+        } catch {
+          Start-Sleep -Seconds $delaySec
+          if ($i -eq $maxTries) { throw }
+        }
+      }
+
+      # 2) Fire scan + deployment eval (retry each briefly if needed)
+      $guids = @(
+        '{00000000-0000-0000-0000-000000000113}', # Software Updates Scan
+        '{00000000-0000-0000-0000-000000000108}'  # Deployment Evaluation
+      )
+
+      foreach($g in $guids){
+        $ok = $false
+        for($t=1; $t -le 5; $t++){
+          try {
+            Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' -Arguments @{ sScheduleID = $g } | Out-Null
+            $ok = $true
+            break
+          } catch {
+            Start-Sleep -Seconds 5
+          }
+        }
+        if (-not $ok) { throw "Failed to trigger schedule $g after retries." }
+      }
+
+      Start-Sleep -Seconds {{ sccm_wait_after_trigger }}
+  changed_when: false
