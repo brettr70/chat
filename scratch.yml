@@ -7,6 +7,14 @@
     pre_reboot_delay: 15
     reboot_timeout: 3600
 
+# NEW: ensure the outer loop runs at least one more pass after a reboot
+- name: Mark another pass required after reboot
+  when:
+    - sccm_allow_reboot | bool
+    - sccm_pending_reboot | bool
+  ansible.builtin.set_fact:
+    sccm_remaining: 9999
+
 - name: Wait after reboot (settle)
   ansible.builtin.pause:
     seconds: "{{ sccm_wait_after_reboot }}"
