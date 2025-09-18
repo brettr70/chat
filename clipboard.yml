@@ -1,1 +1,56 @@
-
+{
+  "changed": false,
+  "invocation": {
+    "module_args": {
+      "depth": 2,
+      "removes": null,
+      "chdir": null,
+      "parameters": null,
+      "creates": null,
+      "executable": null,
+      "error_action": "continue",
+      "arguments": null,
+      "sensitive_parameters": null,
+      "script": "$ErrorActionPreference = 'Stop'\nforeach($g in @(\n  '{00000000-0000-0000-0000-000000000113}', # Software Updates Scan\n  '{00000000-0000-0000-0000-000000000108}'  # Deployment Evaluation\n)){\n  Invoke-CimMethod -Namespace 'root\\ccm' -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' -Arguments @{ sScheduleID = $g } | Out-Null\n}\nStart-Sleep -Seconds 45\n"
+    }
+  },
+  "result": {},
+  "host_out": "",
+  "host_err": "",
+  "output": [],
+  "error": [
+    {
+      "script_stack_trace": "at <ScriptBlock>, <No file>: line 6",
+      "fully_qualified_error_id": "HRESULT 0x80070005,Microsoft.Management.Infrastructure.CimCmdlets.InvokeCimMethodCommand",
+      "exception": {
+        "inner_exception": null,
+        "message": "Access is denied. ",
+        "source": "Microsoft.Management.Infrastructure",
+        "help_link": null,
+        "type": "Microsoft.Management.Infrastructure.CimException",
+        "hresult": -2146233088
+      },
+      "target_object": "root\\ccm:SMS_Client",
+      "error_details": null,
+      "output": "Invoke-CimMethod : Access is denied. \r\nAt line:6 char:3\r\n+   Invoke-CimMethod -Namespace 'root\\ccm' -ClassName 'SMS_Client' -Met ...\r\n+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : PermissionDenied: (root\\ccm:SMS_Client:String) [Invoke-CimMethod], CimException\r\n    + FullyQualifiedErrorId : HRESULT 0x80070005,Microsoft.Management.Infrastructure.CimCmdlets.InvokeCimMethodCommand\r\n \r\n",
+      "pipeline_iteration_info": [
+        0,
+        1,
+        0
+      ],
+      "category_info": {
+        "target_name": "root\\ccm:SMS_Client",
+        "target_type": "String",
+        "activity": "Invoke-CimMethod",
+        "category_id": 18,
+        "reason": "CimException",
+        "category": "PermissionDenied"
+      }
+    }
+  ],
+  "warning": [],
+  "verbose": [],
+  "debug": [],
+  "information": [],
+  "_ansible_no_log": false
+}
