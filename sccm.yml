@@ -1,0 +1,88 @@
+---
+- name: SCCM Updates Autopilot (multi-pass, self-contained)
+  hosts: windows
+  gather_facts: no
+
+  # ---- knobs you may tune per env ----
+  vars:
+    sccm_only_assigned: false       # true = Required only; false = include Available (Software Center "Install")
+    sccm_max_passes: 3              # how many install→reboot cycles at most
+    sccm_poll_seconds: 20
+    sccm_install_timeout: 3600      # give CUs time (60 min)
+    sccm_reboot_grace_seconds: 180  # ignore reboot signal for first 3 min
+    sccm_wait_after_trigger: 45     # sleep after scan/eval triggers
+    sccm_wait_after_reboot: 60      # settle time after reboot
+    sccm_allow_reboot: true
+  # ------------------------------------
+
+  handlers:
+    - name: reboot_now
+      ansible.windows.win_reboot:
+        msg: "Rebooting to complete SCCM updates (Autopilot)."
+        pre_reboot_delay: 15
+        reboot_timeout: 3600
+
+  tasks:
+    - name: Ensure SCCM client is running
+      ansible.windows.win_service:
+        name: CcmExec
+        state: started
+      changed_when: false
+
+    - name: Init loop state
+      ansible.builtin.set_fact:
+        sccm_pass: 0
+        sccm_remaining: 9999
+
+    # Run up to sccm_max_passes; one_pass.yml ends early when remaining == 0 AND no reboot pending
+    - name: Run SCCM update passes until compliant or max passes
+      ansible.builtin.include_tasks: one_pass.yml
+      loop: "{{ range(1, sccm_max_passes + 1) | list }}"
+      loop_control:
+        loop_var: pass_idx
+      when: sccm_remaining | int > 0
+
+    # Final safety sweep so no host is left pending reboot
+    - name: Final reboot sweep (only if still pending)
+      ansible.windows.win_powershell:
+        script: |
+          $ns = 'root\ccm\clientsdk'
+          function Test-PendingReboot {
+            $keys = @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+              'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
+            )
+            foreach($k in $keys){ if(Test-Path $k){ return $true } }
+            try {
+              $cu = Get-CimInstance -Namespace $ns -ClassName CCM_ClientUtilities -ErrorAction Stop
+              if ($cu.DetermineIfRebootPending().RebootPending) { return $true }
+            } catch {}
+            return $false
+          }
+          [Console]::Out.Write((Test-PendingReboot))
+      register: final_reboot_probe
+      changed_when: false
+
+    - name: Interpret final reboot probe
+      ansible.builtin.set_fact:
+        final_reboot_required: >-
+          {{
+            (
+              (final_reboot_probe.host_out | default(''))
+              if (final_reboot_probe.host_out is string)
+              else ((final_reboot_probe.host_out | default([])) | join(''))
+            ) | string | trim | lower in ['true','1','yes']
+          }}
+
+    - name: Final reboot if required
+      when:
+        - sccm_allow_reboot | bool
+        - final_reboot_required | bool
+      ansible.windows.win_reboot:
+        msg: "Final reboot to complete SCCM updates (Autopilot)."
+        pre_reboot_delay: 15
+        reboot_timeout: 3600
+
+
+

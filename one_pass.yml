@@ -1,0 +1,177 @@
+---
+# Bump pass #
+- name: Start pass {{ pass_idx }}
+  ansible.builtin.set_fact:
+    sccm_pass: "{{ pass_idx }}"
+
+# 1) Trigger fresh scan + deployment evaluation
+- name: Trigger SU Scan + Deployment Eval
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      foreach($g in @(
+        '{00000000-0000-0000-0000-000000000113}', # Software Updates Scan
+        '{00000000-0000-0000-0000-000000000108}'  # Deployment Evaluation
+      )){
+        Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' -Arguments @{ sScheduleID = $g } | Out-Null
+      }
+      Start-Sleep -Seconds {{ sccm_wait_after_trigger }}
+  changed_when: false
+
+# 2) Install whatever is actionable (WMI path is broadly compatible), with reboot grace period
+- name: Install SCCM updates (pass {{ pass_idx }})
+  ansible.windows.win_powershell:
+    script: |
+      param(
+        [int]$TimeoutSec = {{ sccm_install_timeout }},
+        [int]$PollSec    = {{ sccm_poll_seconds }},
+        [bool]$OnlyAssigned = [bool]::Parse('{{ sccm_only_assigned }}'),
+        [int]$GraceSec   = {{ sccm_reboot_grace_seconds }}
+      )
+      $ErrorActionPreference = 'Stop'
+      $ns = 'root\ccm\clientsdk'
+
+      function Get-Candidates {
+        $all = Get-WmiObject -Namespace $ns -Class CCM_SoftwareUpdate
+        if (-not $all) { return @() }
+        $cand = $all | Where-Object {
+          ($_.ComplianceState -eq 0) -and (-not $_.IsHidden) -and (-not $_.IsExpired)
+        }
+        if ($OnlyAssigned) { $cand = $cand | Where-Object { $_.IsAssigned -eq $true } }
+        if ($cand -and ($cand -isnot [System.Array])) { $cand = @($cand) }
+        return ,$cand
+      }
+
+      function Test-PendingReboot {
+        $keys = @(
+          'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+          'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+          'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
+        )
+        foreach($k in $keys){ if(Test-Path $k){ return $true } }
+        try {
+          $cu = Get-CimInstance -Namespace $ns -ClassName CCM_ClientUtilities -ErrorAction Stop
+          if ($cu.DetermineIfRebootPending().RebootPending) { return $true }
+        } catch {}
+        return $false
+      }
+
+      $pending = Get-Candidates
+      if (-not $pending -or $pending.Count -eq 0) {
+        Write-Host "No candidates to install."
+        return
+      }
+
+      Invoke-WmiMethod -Namespace $ns -Class 'CCM_SoftwareUpdatesManager' -Name 'InstallUpdates' -ArgumentList (,$pending) | Out-Null
+      Write-Host ("Started install for KBs: " + (($pending | ForEach-Object ArticleID) -join ','))
+
+      $start = Get-Date
+      $deadline = (Get-Date).AddSeconds($TimeoutSec)
+      do {
+        Start-Sleep -Seconds $PollSec
+
+        $elapsed = ((Get-Date) - $start).TotalSeconds
+        if (Test-PendingReboot) {
+          if ($elapsed -ge $GraceSec) {
+            Write-Host "Reboot required; stopping poll (elapsed ${elapsed}s >= grace)."
+            break
+          } else {
+            Write-Host "Reboot flag seen at ${elapsed}s < grace; continue polling."
+          }
+        }
+
+        $still = (Get-Candidates | Measure-Object).Count
+        if ($still -eq 0) { Write-Host "All updates installed."; break }
+      } while ((Get-Date) -lt $deadline)
+  register: install_run
+  changed_when: false
+
+# 3) Verify remaining noncompliant updates (plain count)
+- name: Verify remaining noncompliant updates (plain count)
+  ansible.windows.win_powershell:
+    script: |
+      param([bool]$OnlyAssigned = [bool]::Parse('{{ sccm_only_assigned }}'))
+      $ErrorActionPreference = 'SilentlyContinue'
+      $ns = 'root\ccm\clientsdk'
+      $all = $null
+      try { $all = Get-CimInstance -Namespace $ns -ClassName CCM_SoftwareUpdate } catch {}
+      if (-not $all) { try { $all = Get-WmiObject -Namespace $ns -Class CCM_SoftwareUpdate } catch {} }
+      if (-not $all) { [Console]::Out.Write('0'); return }
+      $cand = $all | Where-Object { $_.ComplianceState -eq 0 -and -not $_.IsHidden -and -not $_.IsExpired }
+      if ($OnlyAssigned) { $cand = $cand | Where-Object { $_.IsAssigned -eq $true } }
+      [Console]::Out.Write( ($cand | Measure-Object).Count )
+  register: verify_raw
+  changed_when: false
+
+- name: Capture remaining count
+  ansible.builtin.set_fact:
+    sccm_remaining: >-
+      {{
+        (
+          (verify_raw.host_out | default(''))
+          if (verify_raw.host_out is string)
+          else ((verify_raw.host_out | default([])) | join(''))
+        ) | string | trim | int
+      }}
+
+# 4) Probe pending reboot *after* verify (plain True/False)
+- name: Probe pending reboot (post-verify)
+  ansible.windows.win_powershell:
+    script: |
+      $ns = 'root\ccm\clientsdk'
+      function Test-PendingReboot {
+        $keys = @(
+          'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+          'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+          'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
+        )
+        foreach($k in $keys){ if(Test-Path $k){ return $true } }
+        try {
+          $cu = Get-CimInstance -Namespace $ns -ClassName CCM_ClientUtilities -ErrorAction Stop
+          if ($cu.DetermineIfRebootPending().RebootPending) { return $true }
+        } catch {}
+        return $false
+      }
+      [Console]::Out.Write((Test-PendingReboot))
+  register: reboot_probe_after
+  changed_when: false
+
+- name: Interpret reboot probe (post-verify)
+  ansible.builtin.set_fact:
+    sccm_pending_reboot: >-
+      {{
+        (
+          (reboot_probe_after.host_out | default(''))
+          if (reboot_probe_after.host_out is string)
+          else ((reboot_probe_after.host_out | default([])) | join(''))
+        ) | string | trim | lower in ['true','1','yes']
+      }}
+
+# 5) If reboot needed and allowed, notify handler, flush, and settle
+- name: Notify reboot handler
+  ansible.builtin.debug:
+    msg: "Reboot required in pass {{ pass_idx }}; notifying handler."
+  when:
+    - sccm_allow_reboot | bool
+    - sccm_pending_reboot | bool
+  notify: reboot_now
+
+- name: Flush handlers (perform reboot now)
+  ansible.builtin.meta: flush_handlers
+  when:
+    - sccm_allow_reboot | bool
+    - sccm_pending_reboot | bool
+
+- name: Wait after reboot (settle)
+  ansible.builtin.pause:
+    seconds: "{{ sccm_wait_after_reboot }}"
+  when:
+    - sccm_allow_reboot | bool
+    - sccm_pending_reboot | bool
+
+# 6) End early only if compliant *and* no reboot is pending
+- name: End play when compliant and no reboot pending in pass {{ pass_idx }}
+  ansible.builtin.meta: end_play
+  when:
+    - sccm_remaining | int == 0
+    - not (sccm_pending_reboot | default(false) | bool)
